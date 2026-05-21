@@ -1,11 +1,10 @@
 """
 ai_services/evaluator.py - AI Student Answer Evaluation Service
-
-Evaluates student answers against rubrics and generates detailed feedback.
 """
 
 import json
 import re
+import asyncio
 from typing import Optional
 from datetime import datetime
 from bson import ObjectId
@@ -19,11 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_json_from_response(text: str) -> dict:
-    """
-    Extract the JSON block from the AI response.
-    The evaluation prompt asks the AI to include a JSON block at the end.
-    """
-    # Look for ```json ... ``` block
     json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if json_match:
         try:
@@ -31,7 +25,6 @@ def _extract_json_from_response(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: try to find any JSON-like structure
     json_match = re.search(r"\{[^{}]*\"marks_obtained\"[^{}]*\}", text, re.DOTALL)
     if json_match:
         try:
@@ -39,7 +32,6 @@ def _extract_json_from_response(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Default fallback values
     return {
         "marks_obtained": 0,
         "total_marks": 50,
@@ -51,7 +43,6 @@ def _extract_json_from_response(text: str) -> dict:
 
 
 def _calculate_grade(percentage: float) -> str:
-    """Convert percentage to letter grade."""
     if percentage >= 90:
         return "A+"
     elif percentage >= 80:
@@ -78,23 +69,6 @@ async def evaluate_student_answer(
     model_answer: Optional[str] = None,
     rubric_id: Optional[str] = None,
 ) -> dict:
-    """
-    Evaluate a student's answer using AI.
-    
-    Args:
-        user_id: Teacher's user ID
-        student_name: Name of the student
-        assignment_title: Title of the assignment
-        student_answer: The student's submitted answer text
-        rubric_text: The grading rubric
-        total_marks: Maximum marks
-        model_answer: Optional ideal answer for comparison
-        rubric_id: Optional reference to saved rubric
-    
-    Returns:
-        Dict with evaluation results including marks, grade, and feedback
-    """
-    # Format the evaluation prompt
     formatted_prompt = evaluation_prompt.format(
         assignment_title=assignment_title,
         student_name=student_name,
@@ -104,10 +78,32 @@ async def evaluate_student_answer(
         total_marks=total_marks,
     )
 
-    llm = get_llm(temperature=0.3)  # Low temperature for consistent evaluation
+    llm = get_llm(temperature=0.3)
     logger.info(f"Evaluating answer for student: {student_name}")
-    response = await llm.ainvoke(formatted_prompt)
-    full_feedback = response.content
+
+    # Retry up to 3 times on rate limit (429) errors
+    full_feedback = ""
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = await llm.ainvoke(formatted_prompt)
+            full_feedback = response.content
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            if "429" in str(e) and attempt < 2:
+                wait = 35 * (attempt + 1)  # 35s then 70s
+                logger.warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt+1}/3)...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+    if last_error:
+        raise last_error
+
+    if not full_feedback:
+        raise ValueError("No response received from AI model")
 
     # Extract structured data from the response
     eval_data = _extract_json_from_response(full_feedback)
@@ -150,7 +146,6 @@ async def evaluate_student_answer(
 
 
 async def get_evaluations(user_id: str, limit: int = 50) -> list:
-    """Retrieve all evaluations for a teacher."""
     db = get_database()
     cursor = db.evaluations.find(
         {"user_id": user_id},

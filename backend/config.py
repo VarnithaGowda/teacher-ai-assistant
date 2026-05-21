@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "teacher_ai_db"
 
     # Gemini
-    GEMINI_API_KEY: str = ""
+    GEMINI_API_KEY: str = "AIzaSyDBER4HqkFKCrEYNn-MoJvff18klvCTyvc"
     GEMINI_MODEL: str = "gemini-1.5-flash"
 
     # ChromaDB
