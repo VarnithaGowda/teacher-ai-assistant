@@ -1,3 +1,7 @@
+"""
+ai_services/gemini_client.py - Gemini LLM client using LangChain
+"""
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from config import settings
 import logging
@@ -5,6 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _llm_cache = {}
+
 
 def get_llm(temperature: float = 0.7) -> ChatGoogleGenerativeAI:
     global _llm_cache
@@ -17,6 +22,7 @@ def get_llm(temperature: float = 0.7) -> ChatGoogleGenerativeAI:
             temperature=temperature,
         )
     return _llm_cache[temperature]
+
 
 async def generate_text(prompt: str, temperature: float = 0.7) -> str:
     try:

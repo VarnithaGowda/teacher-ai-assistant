@@ -24,39 +24,24 @@ def _extract_json_from_response(text: str) -> dict:
             return json.loads(json_match.group(1))
         except json.JSONDecodeError:
             pass
-
     json_match = re.search(r"\{[^{}]*\"marks_obtained\"[^{}]*\}", text, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group(0))
         except json.JSONDecodeError:
             pass
-
-    return {
-        "marks_obtained": 0,
-        "total_marks": 50,
-        "percentage": 0,
-        "grade": "N/A",
-        "strengths": [],
-        "improvements": [],
-    }
+    return {"marks_obtained": 0, "total_marks": 50, "percentage": 0,
+            "grade": "N/A", "strengths": [], "improvements": []}
 
 
 def _calculate_grade(percentage: float) -> str:
-    if percentage >= 90:
-        return "A+"
-    elif percentage >= 80:
-        return "A"
-    elif percentage >= 75:
-        return "B+"
-    elif percentage >= 65:
-        return "B"
-    elif percentage >= 60:
-        return "C"
-    elif percentage >= 50:
-        return "D"
-    else:
-        return "F"
+    if percentage >= 90: return "A+"
+    elif percentage >= 80: return "A"
+    elif percentage >= 75: return "B+"
+    elif percentage >= 65: return "B"
+    elif percentage >= 60: return "C"
+    elif percentage >= 50: return "D"
+    else: return "F"
 
 
 async def evaluate_student_answer(
@@ -81,38 +66,28 @@ async def evaluate_student_answer(
     llm = get_llm(temperature=0.3)
     logger.info(f"Evaluating answer for student: {student_name}")
 
-    # Retry up to 3 times on rate limit (429) errors
     full_feedback = ""
-    last_error = None
     for attempt in range(3):
         try:
             response = await llm.ainvoke(formatted_prompt)
             full_feedback = response.content
-            last_error = None
             break
         except Exception as e:
-            last_error = e
             if "429" in str(e) and attempt < 2:
-                wait = 35 * (attempt + 1)  # 35s then 70s
-                logger.warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt+1}/3)...")
+                wait = 35 * (attempt + 1)
+                logger.warning(f"Rate limit hit, retrying in {wait}s...")
                 await asyncio.sleep(wait)
             else:
                 raise
 
-    if last_error:
-        raise last_error
-
     if not full_feedback:
         raise ValueError("No response received from AI model")
 
-    # Extract structured data from the response
     eval_data = _extract_json_from_response(full_feedback)
-
     marks_obtained = float(eval_data.get("marks_obtained", 0))
     percentage = (marks_obtained / total_marks * 100) if total_marks > 0 else 0
     grade = _calculate_grade(percentage)
 
-    # Save to MongoDB
     db = get_database()
     doc = {
         "user_id": user_id,
@@ -147,11 +122,7 @@ async def evaluate_student_answer(
 
 async def get_evaluations(user_id: str, limit: int = 50) -> list:
     db = get_database()
-    cursor = db.evaluations.find(
-        {"user_id": user_id},
-        sort=[("created_at", -1)],
-        limit=limit,
-    )
+    cursor = db.evaluations.find({"user_id": user_id}, sort=[("created_at", -1)], limit=limit)
     evals = []
     async for doc in cursor:
         doc["id"] = str(doc.pop("_id"))

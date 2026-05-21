@@ -1,159 +1,138 @@
 """
-ai_services/evaluator.py - AI Student Answer Evaluation Service
+ai_services/chatbot.py - Teacher AI Chatbot with RAG support
 """
 
-import json
+import uuid
 import re
 import asyncio
 from typing import Optional
 from datetime import datetime
-from bson import ObjectId
 import logging
 
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from database.connection import get_database
-from prompts.evaluation_prompt import evaluation_prompt
 from ai_services.gemini_client import get_llm
+from vector_store.chroma_client import get_rag_context
 
 logger = logging.getLogger(__name__)
 
-
-def _extract_json_from_response(text: str) -> dict:
-    json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    json_match = re.search(r"\{[^{}]*\"marks_obtained\"[^{}]*\}", text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return {
-        "marks_obtained": 0,
-        "total_marks": 50,
-        "percentage": 0,
-        "grade": "N/A",
-        "strengths": [],
-        "improvements": [],
-    }
+_sessions: dict = {}
 
 
-def _calculate_grade(percentage: float) -> str:
-    if percentage >= 90:
-        return "A+"
-    elif percentage >= 80:
-        return "A"
-    elif percentage >= 75:
-        return "B+"
-    elif percentage >= 65:
-        return "B"
-    elif percentage >= 60:
-        return "C"
-    elif percentage >= 50:
-        return "D"
-    else:
-        return "F"
+def _get_or_create_session(session_id: Optional[str]) -> tuple[str, list]:
+    if not session_id or session_id not in _sessions:
+        session_id = str(uuid.uuid4())
+        _sessions[session_id] = []
+    return session_id, _sessions[session_id]
 
 
-async def evaluate_student_answer(
+async def chat_with_teacher_bot(
     user_id: str,
-    student_name: str,
-    assignment_title: str,
-    student_answer: str,
-    rubric_text: str,
-    total_marks: int = 50,
-    model_answer: Optional[str] = None,
-    rubric_id: Optional[str] = None,
+    message: str,
+    session_id: Optional[str] = None,
+    use_rag: bool = True,
 ) -> dict:
-    formatted_prompt = evaluation_prompt.format(
-        assignment_title=assignment_title,
-        student_name=student_name,
-        rubric=rubric_text,
-        model_answer=model_answer or "Not provided",
-        student_answer=student_answer,
-        total_marks=total_marks,
-    )
+    session_id, history = _get_or_create_session(session_id)
 
-    llm = get_llm(temperature=0.3)
-    logger.info(f"Evaluating answer for student: {student_name}")
+    context = "No documents uploaded yet."
+    sources = []
+    if use_rag:
+        try:
+            rag_result = await get_rag_context(user_id, message, n_results=4)
+            if rag_result:
+                context = rag_result
+                sources = re.findall(r"\[Source \d+: (.+?)\]", context)
+        except Exception as e:
+            logger.warning(f"RAG context fetch failed, continuing without it: {e}")
 
-    # Retry up to 3 times on rate limit (429) errors
-    full_feedback = ""
-    last_error = None
+    system_prompt = f"""You are an intelligent AI teaching assistant designed to help teachers with:
+- Answering questions about curriculum and syllabus content
+- Generating quizzes, assignments, and activities
+- Providing teaching strategies and tips
+- Explaining concepts in student-friendly language
+
+CONTEXT FROM UPLOADED DOCUMENTS:
+{context}
+
+Always be helpful, professional, and encouraging. Format responses clearly with bullet points when appropriate."""
+
+    messages = [SystemMessage(content=system_prompt)]
+    for msg in history[-10:]:
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        else:
+            messages.append(AIMessage(content=msg["content"]))
+    messages.append(HumanMessage(content=message))
+
+    llm = get_llm(temperature=0.7)
+    logger.info(f"Chatbot processing message for user {user_id}")
+
+    ai_response = ""
     for attempt in range(3):
         try:
-            response = await llm.ainvoke(formatted_prompt)
-            full_feedback = response.content
-            last_error = None
+            response = await llm.ainvoke(messages)
+            ai_response = response.content
             break
         except Exception as e:
-            last_error = e
             if "429" in str(e) and attempt < 2:
-                wait = 35 * (attempt + 1)  # 35s then 70s
-                logger.warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt+1}/3)...")
+                wait = 35 * (attempt + 1)
+                logger.warning(f"Rate limit hit, retrying in {wait}s...")
                 await asyncio.sleep(wait)
             else:
                 raise
 
-    if last_error:
-        raise last_error
-
-    if not full_feedback:
+    if not ai_response:
         raise ValueError("No response received from AI model")
 
-    # Extract structured data from the response
-    eval_data = _extract_json_from_response(full_feedback)
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": ai_response})
+    _sessions[session_id] = history
 
-    marks_obtained = float(eval_data.get("marks_obtained", 0))
-    percentage = (marks_obtained / total_marks * 100) if total_marks > 0 else 0
-    grade = _calculate_grade(percentage)
-
-    # Save to MongoDB
     db = get_database()
-    doc = {
+    await db.chat_history.insert_one({
         "user_id": user_id,
-        "student_name": student_name,
-        "assignment_title": assignment_title,
-        "rubric_id": rubric_id,
-        "marks_obtained": marks_obtained,
-        "total_marks": total_marks,
-        "percentage": round(percentage, 2),
-        "grade": grade,
-        "feedback": full_feedback,
-        "strengths": eval_data.get("strengths", []),
-        "improvements": eval_data.get("improvements", []),
+        "session_id": session_id,
+        "user_message": message,
+        "ai_response": ai_response,
+        "sources": sources,
         "created_at": datetime.utcnow(),
-    }
-    result = await db.evaluations.insert_one(doc)
+    })
 
-    return {
-        "id": str(result.inserted_id),
-        "student_name": student_name,
-        "assignment_title": assignment_title,
-        "marks_obtained": marks_obtained,
-        "total_marks": total_marks,
-        "percentage": round(percentage, 2),
-        "grade": grade,
-        "feedback": full_feedback,
-        "strengths": eval_data.get("strengths", []),
-        "improvements": eval_data.get("improvements", []),
-        "created_at": doc["created_at"],
-    }
+    return {"session_id": session_id, "message": ai_response, "sources": sources}
 
 
-async def get_evaluations(user_id: str, limit: int = 50) -> list:
+async def get_chat_history(user_id: str, session_id: Optional[str] = None, limit: int = 50) -> list:
     db = get_database()
-    cursor = db.evaluations.find(
-        {"user_id": user_id},
-        sort=[("created_at", -1)],
-        limit=limit,
-    )
-    evals = []
+    query = {"user_id": user_id}
+    if session_id:
+        query["session_id"] = session_id
+    cursor = db.chat_history.find(query, sort=[("created_at", -1)], limit=limit)
+    history = []
     async for doc in cursor:
         doc["id"] = str(doc.pop("_id"))
-        evals.append(doc)
-    return evals
+        history.append(doc)
+    return list(reversed(history))
+
+
+async def get_chat_sessions(user_id: str) -> list:
+    db = get_database()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": "$session_id",
+            "last_message": {"$last": "$user_message"},
+            "last_activity": {"$max": "$created_at"},
+            "message_count": {"$sum": 1},
+        }},
+        {"$sort": {"last_activity": -1}},
+        {"$limit": 20},
+    ]
+    sessions = []
+    async for doc in db.chat_history.aggregate(pipeline):
+        sessions.append({
+            "session_id": doc["_id"],
+            "last_message": doc["last_message"],
+            "last_activity": doc["last_activity"],
+            "message_count": doc["message_count"],
+        })
+    return sessions
